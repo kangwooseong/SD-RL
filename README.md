@@ -5,7 +5,7 @@ ViSpec 기반 강화학습 적용: ViSpec의 고정된 draft 깊이와 검증 �
 - 기반 코드: [ViSpec](https://github.com/KangJialiang/ViSpec) (NeurIPS 2025, Apache-2.0, 커밋 `49a33ff`). 원본 설명은 `README_ViSpec.md`에 있습니다.
 - 참고 방법: [Learning to Draft](https://github.com/zhzihao/Learning-to-Draft) (ICLR 2026)의 depth/size 두 정책 구조를 따릅니다.
 
-> **상태: 아직 GPU에서 실행해 보지 않은 코드입니다.** 문법 검사만 통과했습니다. 학습 전에 아래 "먼저 확인할 것"을 순서대로 점검하세요.
+> **상태: 아직 GPU에서 실행해 보지 않은 코드입니다.** 문법 검사만 통과했습니다. 본 학습 전에 아래 "실험 시작 전 체크리스트"를 순서대로 진행하세요.
 
 ## 구조
 
@@ -65,6 +65,134 @@ Learning to Draft 방식의 사이클별 처리량입니다. 사이클 하나가
 ```bash
 pip install -r requirements.txt
 ```
+
+## 실험 시작 전 체크리스트
+
+본 학습에 들어가기 전에 아래 순서대로 진행합니다. 앞 단계가 통과하지 않으면 다음 단계의 숫자는 믿을 수 없습니다. 통과 기준 중 수치(%)는 권장값이며 팀에서 조정할 수 있습니다.
+
+공통 변수
+
+```bash
+BASE=llava-hf/llava-v1.6-vicuna-7b-hf
+SPEC=JLKang/ViSpec-llava-v1.6-vicuna-7b-hf
+COMMON="--base-model-path $BASE --spec-model-path $SPEC --model-id test"
+VISPEC="--num-q 2 --top-k 8 --use-ours=True"
+```
+
+결과 파일(`<bench-name>/test-temperature-0.0.jsonl`)에는 문항별 `new_tokens`, `wall_time`, `acceptance_length`, 생성 텍스트(`turns`)가 들어 있습니다. 처리량은 문항별 `new_tokens / wall_time`의 평균이고, 배율은 `vispec/evaluation/speed.py`와 같은 방식(ViSpec 평균 ÷ baseline 평균)으로 계산합니다. `speed.py`는 폴더 이름이 코드에 고정돼 있으므로, 아래 폴더 이름을 쓰거나 스크립트의 목록을 수정해서 사용합니다.
+
+### 0. 측정 조건 고정
+
+- 모든 측정을 같은 GPU 한 장에서 하고, 측정 중에는 그 GPU에 다른 작업을 올리지 않습니다.
+- GPU 모델, 드라이버, PyTorch/transformers 버전을 기록해 둡니다(`requirements.txt` 기준).
+- 같은 설정을 3회 이상 반복해 평균과 표준편차를 구합니다. 이 표준편차가 이후 단계의 "오차 범위"입니다.
+
+통과 기준: 같은 설정 반복 측정의 처리량 편차가 2~3% 이내.
+
+### 1. ViSpec 재현
+
+```bash
+# Target 단독 (baseline)
+python -m vispec.evaluation.gen_baseline_answer_coco_caption $COMMON \
+  --bench-name baseline_results/coco_caption_test/baseline_llava/ --temperature 0
+
+# ViSpec 기본 설정 (깊이 3, 후보 30)
+python -m vispec.evaluation.gen_spec_answer_coco_caption $COMMON $VISPEC \
+  --bench-name results/coco_caption_test/llava_2q/ --depth 3 --total-token 30 --temperature 0
+```
+
+`--temperature 1`로도 한 번씩 실행합니다. 전체 벤치마크는 `baseline.sh`, `exp.sh`로 돌립니다.
+
+통과 기준: 배율이 ViSpec 논문의 같은 모델·데이터셋 수치와 비슷한 수준. 크게 다르면 환경 문제부터 해결합니다. 이 결과가 이후 모든 비교의 기준선입니다.
+
+### 2. RL 훅이 원본 동작을 바꾸지 않는지 확인
+
+```bash
+# (a) 원본 코드: "Import ViSpec" 커밋으로 이동해 1번의 ViSpec 명령을 실행
+git checkout <Import ViSpec 커밋>   # 결과 폴더: results/coco_caption_test/orig/
+git checkout rl-draft-controller
+
+# (b) 이 브랜치, 환경변수 없음: 1번 결과를 그대로 사용
+
+# (c) 컨트롤러만 연결, 고정값 사용
+VISPEC_RL_POLICY=fixed python -m vispec.evaluation.gen_spec_answer_coco_caption $COMMON $VISPEC \
+  --bench-name results/coco_caption_test/hook_fixed/ --depth 3 --total-token 30 --temperature 0
+```
+
+통과 기준: (a), (b), (c)의 생성 텍스트가 temperature 0에서 모두 동일하고, 처리량 차이가 0번의 오차 범위 이내. 다르면 훅 코드에 문제가 있는 것이므로 학습을 시작하지 않습니다.
+
+### 3. 시간 분해 확인
+
+```bash
+VISPEC_RL_POLICY=fixed VISPEC_RL_PROFILE=profile_vispec.json \
+python -m vispec.evaluation.gen_spec_answer_coco_caption $COMMON $VISPEC \
+  --bench-name results/coco_caption_test/profile/ --depth 3 --total-token 30 --temperature 0
+```
+
+`profile_vispec.json`에 사이클당 draft 시간, 검증 시간, 사이클당 토큰 수가 기록됩니다. 매 사이클 동기화하므로 이 실행의 속도는 대표 수치로 쓰지 않습니다.
+
+통과 기준: 값이 상식적일 것(검증 시간이 draft 시간보다 큼, 사이클당 토큰 수가 1번 결과의 평균 수락 길이 + 1과 비슷함). draft 시간 비중이 매우 작으면 depth 정책으로 얻을 이득이 작다는 뜻이므로 4번 결과와 함께 판단합니다.
+
+### 4. 고정값 sweep (개선 여지 확인, 진행 여부 판단)
+
+```bash
+for d in 1 2 3 4 5 6; do for n in 10 20 30 40 50 60; do
+python -m vispec.evaluation.gen_spec_answer_coco_caption $COMMON $VISPEC \
+  --bench-name results/coco_caption_test/sweep_d${d}_n${n}/ --depth $d --total-token $n --temperature 0
+done; done
+```
+
+조합마다 모델을 다시 올리므로 시간이 오래 걸립니다. 처음에는 격자를 줄여서(예: 깊이 2·3·4·6, 후보 20·30·40·60) 돌리고, 성격이 다른 데이터셋 하나(예: ScienceQA 또는 TextVQA)에서도 반복합니다.
+
+확인할 것
+
+- 데이터셋별 최적 고정값과, 그것이 ViSpec 기본값(3, 30)보다 얼마나 빠른지
+- 최적 조합이 데이터셋마다 다른지
+- 가능하면 문항별 최적 조합을 골랐을 때의 처리량(동적 조절의 상한 추정)
+
+통과 기준(권장): 최적 고정값이 데이터셋마다 다르거나, 문항별 최적의 이득이 기본값 대비 5% 이상이면 진행합니다. 기본값이 모든 곳에서 최적이고 이득이 오차 범위 수준이면 RL로 얻을 것이 거의 없으므로 방향을 재검토합니다.
+
+이 결과로 학습 옵션도 정합니다. 최적 조합이 격자의 가장자리에 있으면 `--max-depth`, `--size-choices` 범위를 넓힙니다.
+
+### 5. 비교군 확정
+
+- **최적 고정값**: 4번에서 찾은 데이터셋별 최적 조합. "잘 튜닝한 ViSpec"에 해당하며 반드시 이겨야 하는 대상입니다.
+- **규칙 기반 동적 방식**: 확신도 임계값으로 draft를 멈추는 방식 등. 이 저장소에는 아직 구현되어 있지 않으므로 별도 구현이 필요합니다.
+- **시각 특징 없는 정책**: `--no-visual`로 학습한 정책.
+
+통과 기준: 본 실험 전에 비교군 목록과 각 비교군의 설정이 문서로 확정되어 있을 것.
+
+### 6. 학습 스모크 테스트
+
+```bash
+python -m vispec.rl.train_ppo --base-model-path $BASE --spec-model-path $SPEC \
+  --dataset scienceqa --train both --save-dir rl_ckpt/smoke \
+  --total-cycles 8000 --rollout 1024 --val-num 10 --val-every 2
+```
+
+통과 기준
+
+- 에러 없이 끝나고 `rl_ckpt/smoke/train_log.jsonl`, `policy_last.pt`가 생성됨
+- 보정 로그의 `vispec_rate_measured`가 3번에서 구한 처리량과 비슷함
+- `r2_draft`, `r2_verify`가 대략 0.8 이상(`--time-source model`을 쓸 계획일 때만 필요)
+- `action_dist`가 처음부터 한 행동으로 쏠리지 않고, `entropy`가 서서히 줄어듦
+- `val_speedup_vs_vispec`가 기록됨(이 단계에서는 1보다 작아도 됨)
+
+### 7. 무손실 확인
+
+```bash
+VISPEC_RL_POLICY=rl_ckpt/smoke/policy_last.pt \
+python -m vispec.evaluation.gen_spec_answer_coco_caption $COMMON $VISPEC \
+  --bench-name results/coco_caption_test/rl_smoke/ --depth 3 --total-token 30 --temperature 0
+```
+
+1번 baseline 결과와 문항별 생성 텍스트(`choices[0].turns`)를 비교합니다.
+
+통과 기준: 텍스트가 일치함. 트리 모양이 달라지면 반정밀도 연산 오차로 드물게 달라질 수 있으므로 불일치 건수를 기록하고, 1번의 ViSpec 대 baseline 불일치 건수와 비슷한 수준인지 확인합니다. 불일치가 훨씬 많으면 훅 코드를 다시 점검합니다.
+
+### 8. 본 학습 시작
+
+0~7이 모두 통과하면 "학습" 항목의 순서대로 진행합니다. 0번과 4번의 결과(오차 범위, sweep 표)는 논문의 실험 설정과 ablation에 그대로 쓰이므로 보관합니다.
 
 ## 데이터
 
@@ -137,13 +265,6 @@ python -m vispec.evaluation.gen_spec_answer_coco_caption --base-model-path $BASE
 | `VISPEC_RL_POLICY=fixed` + `VISPEC_RL_PROFILE=...` | ViSpec 원본 설정의 시간 분해 |
 
 `--top-k`는 학습 때와 같아야 합니다(기본 8).
-
-## 먼저 확인할 것
-
-1. 환경변수 없이 실행: 원본 ViSpec과 결과가 같은지.
-2. `VISPEC_RL_POLICY=fixed`: 출력과 속도가 1과 같은지. 다르면 훅에 문제가 있습니다.
-3. 학습된 정책 + `--temperature 0`: 생성 텍스트가 baseline과 일치하는지. 트리 모양이 달라지면 반정밀도 연산 오차로 드물게 달라질 수 있으니 불일치 건수를 세어 둡니다.
-4. 보정 로그: `r2_draft`, `r2_verify`, `vispec_rate_measured`가 상식적인 값인지.
 
 ## 라이선스
 
