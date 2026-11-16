@@ -26,7 +26,7 @@ ViSpec과 Target VLM은 고정하고 작은 MLP 정책 두 개만 학습합니�
 |---|---|
 | `vispec/model/cnets_ours.py` (`topK_genrate`) | 확장 루프 안에 depth 결정, 후보 선택 직전에 size 결정 훅 추가. 트리가 얕을 때 후보 수가 노드 수를 넘지 않게 상한 처리 |
 | `vispec/model/spec_model_ours.py` (`specgenerate`, `from_pretrained`) | 사이클별 시간 측정과 보상 훅 추가. 환경변수 `VISPEC_RL_POLICY`로 정책 연결 |
-| `vispec/rl/` (신규) | `controller.py`(상태·행동·보상), `cost_model.py`(시간 비용 모델), `ppo.py`, `train_ppo.py` |
+| `vispec/rl/` (신규) | `controller.py`(상태·행동·보상), `cost_model.py`(시간 비용 모델), `data.py`(학습·검증 프롬프트), `ppo.py`, `train_ppo.py` |
 
 수정한 줄에는 `[RL]` 주석이 있습니다. 정책을 연결하지 않으면 동작은 원본과 같습니다.
 
@@ -66,6 +66,21 @@ Learning to Draft 방식의 사이클별 처리량입니다. 사이클 하나가
 pip install -r requirements.txt
 ```
 
+## 데이터
+
+정책 학습에는 프롬프트(이미지 + 질문)만 필요합니다. 보상이 속도에서만 나오므로 정답 라벨은 쓰지 않습니다. 모든 세트는 평가 벤치마크가 쓰는 문항과 겹치지 않게 나눠져 있습니다(`vispec/rl/data.py`).
+
+| 이름 | 학습 | 검증 | 벤치마크가 쓰는 부분 | 준비 |
+|---|---|---|---|---|
+| `llava_pretrain` | seed-42 셔플의 68,000번 이후 | 셔플 끝 500개 | 벤치마크 아님. ViSpec draft 모델은 0~67,999번으로 학습 | `--llava-pretrain-dir`: `blip_laion_cc_sbu_558k.json`과 이미지 (Hugging Face `liuhaotian/LLaVA-Pretrain`) |
+| `scienceqa` | train split (이미지 있는 문항) | val split | test split | 자동 다운로드 |
+| `textvqa` | `TextVQA_0.5.1_train.json` | 같은 목록의 끝 500개 | `TextVQA_0.5.1_val.json` | `--textvqa-dir`: train json과 `train_images/` |
+| `coco_caption` | seed-42 셔플의 100번 이후 | 셔플 끝 500개 | 0~99번 | 자동 다운로드 |
+
+- `--dataset`에 쉼표로 여러 개를 주면 섞어서 학습합니다. 세트마다 `--train-num`개(기본 2000)를 씁니다.
+- 권장 구성은 `llava_pretrain,scienceqa,textvqa`입니다. COCO를 빼 두면 COCO 캡션 벤치마크가 "학습에 쓰지 않은 분포"로 남습니다. GQA, MME, MM-Vet, SEED-Bench, VizWiz는 어느 경우에도 학습에 쓰이지 않습니다.
+- **검증**: `--val-every`번(기본 10) 업데이트마다 검증 프롬프트(`--val-num`, 세트당 기본 30개)에서 실측 처리량을 재고 ViSpec 고정 설정 대비 배율(`val_speedup_vs_vispec`)을 로그에 남깁니다. 가장 빠른 체크포인트는 `policy_best.pt`로 저장됩니다. 검증 세트는 `--val-dataset`으로 따로 지정할 수 있고, `--val-num 0`이면 끕니다.
+
 ## 학습
 
 학습을 시작하면 먼저 보정 단계가 돕니다(`--calib-prompts`, 기본 30개): ViSpec 고정 설정으로 기준 처리량을 재고, 무작위 깊이/후보 수로 비용 모델을 맞춥니다.
@@ -73,19 +88,22 @@ pip install -r requirements.txt
 ```bash
 BASE=llava-hf/llava-v1.6-vicuna-7b-hf
 SPEC=JLKang/ViSpec-llava-v1.6-vicuna-7b-hf
+DATA="--dataset llava_pretrain,scienceqa,textvqa --llava-pretrain-dir /data/LLaVA-Pretrain --textvqa-dir /data/textvqa"
 
 # 1) size 정책 (깊이는 무작위)
-python -m vispec.rl.train_ppo --base-model-path $BASE --spec-model-path $SPEC \
+python -m vispec.rl.train_ppo --base-model-path $BASE --spec-model-path $SPEC $DATA \
   --train size --depth-mode random --save-dir rl_ckpt/s1 --total-cycles 100000
 
 # 2) depth 정책 (size 정책은 고정)
-python -m vispec.rl.train_ppo --base-model-path $BASE --spec-model-path $SPEC \
+python -m vispec.rl.train_ppo --base-model-path $BASE --spec-model-path $SPEC $DATA \
   --train depth --resume rl_ckpt/s1/policy_last.pt --save-dir rl_ckpt/s2 --total-cycles 100000
 
 # 3) 두 정책 함께 미세조정
-python -m vispec.rl.train_ppo --base-model-path $BASE --spec-model-path $SPEC \
+python -m vispec.rl.train_ppo --base-model-path $BASE --spec-model-path $SPEC $DATA \
   --train both --resume rl_ckpt/s2/policy_last.pt --save-dir rl_ckpt/s3 --total-cycles 50000 --lr 1e-4
 ```
+
+데이터를 아직 받지 않았다면 `--dataset coco_caption`(기본값)이나 `--dataset scienceqa`만으로도 바로 돌려볼 수 있습니다.
 
 주요 옵션
 
@@ -98,7 +116,7 @@ python -m vispec.rl.train_ppo --base-model-path $BASE --spec-model-path $SPEC \
 | `--max-depth`, `--size-choices` | 행동 범위 |
 | `--skip-calib` | `--resume` 체크포인트의 비용 모델과 기준 처리량 재사용 (같은 GPU·모델일 때만) |
 
-학습 프롬프트는 COCO 캡션에서 벤치마크가 쓰는 100장을 제외한 이미지입니다. 보상이 속도에서만 나오므로 정답 라벨은 필요 없습니다. 다른 학습 세트는 `train_ppo.py`의 `load_train_data`에 추가합니다. 로그는 `<save-dir>/train_log.jsonl`에 남습니다.
+로그는 `<save-dir>/train_log.jsonl`에 남습니다. 다른 학습 세트는 `vispec/rl/data.py`에 로더를 추가하면 됩니다.
 
 ## 평가
 

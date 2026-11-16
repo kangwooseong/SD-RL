@@ -3,6 +3,8 @@
 Steps
   1. calibration: measure plain ViSpec (reference throughput) and fit the cost model
   2. PPO: collect cycles, update the policies, refresh the reference throughput
+  3. validation every --val-every updates on held-out prompts (measured speed,
+     greedy actions); the best checkpoint is saved as policy_best.pt
 
 Example (full recipe in README.md):
 python -m vispec.rl.train_ppo \
@@ -20,42 +22,26 @@ import time
 import torch
 
 from .controller import DraftController, RLConfig
+from .data import NAMES, load_prompts
 from .ppo import PPOTrainer
 
 
-def load_train_data(args):
-    """Prompts used to train the policies. Must not overlap with the evaluation prompts.
-
-    Only prompts (image + question) are needed: the reward comes from speed, not labels.
-    The ViSpec COCO-caption benchmark uses the first 100 images of the seed-42 shuffle,
-    so training starts at index --train-start (default 100) of the same shuffle.
-    Add other training sets here (return an indexable dataset + its build_prompt).
-    """
-    if args.dataset == "coco_caption":
-        from datasets import load_dataset
-
-        from ..evaluation.coco_caption_prompt import build_prompt
-
-        dataset = load_dataset("HuggingFaceM4/COCO", split="test")
-        imgid_indices = {d["imgid"]: idx for idx, d in enumerate(dataset)}
-        dataset = dataset.select(imgid_indices.values()).shuffle(seed=42)
-        end = min(args.train_start + args.train_num, len(dataset))
-        if args.train_start < 100:
-            print("WARNING: --train-start < 100 overlaps with the COCO-caption benchmark prompts")
-        return dataset.select(range(args.train_start, end)), build_prompt
-    raise NotImplementedError(f"unknown --dataset {args.dataset}")
+def generate(model, inputs, args, max_new_tokens=None):
+    model.specgenerate(**inputs, temperature=args.temperature,
+                       max_new_tokens=max_new_tokens or args.max_new_token, log=True)
 
 
-def calibrate(model, ctrl, data, build_prompt, args):
+def calibrate(model, ctrl, pool, args):
     """Reference throughput of plain ViSpec + cost model. Always uses measured time."""
     ctrl.measure, ctrl.log_cycles, ctrl.time_source = True, True, "measured"
-    n = min(args.calib_prompts, len(data))
+    # spread the calibration prompts over all training sets
+    n = min(args.calib_prompts, len(pool))
+    picks = random.Random(args.seed).sample(range(len(pool)), n)
 
     def run():
         ctrl.cycle_log = []
-        for j in range(n):
-            model.specgenerate(**build_prompt(data[j], args), temperature=args.temperature,
-                               max_new_tokens=args.max_new_token, log=True)
+        for j in picks:
+            generate(model, pool.inputs(j), args)
         return ctrl.cycle_log
 
     # A) ViSpec's fixed setting (--depth / --total-token)
@@ -76,6 +62,30 @@ def calibrate(model, ctrl, data, build_prompt, args):
     return {**fit, "vispec_rate_measured": rate_measured, "vispec_rate_model": rate_model}
 
 
+def validate(model, ctrl, pool, args, use_policy):
+    """Measured throughput on the validation prompts (first cycle of each prompt excluded).
+
+    use_policy=False: plain ViSpec (--depth / --total-token).
+    use_policy=True : greedy actions of the policies trained so far; a policy that has
+                      not been trained yet falls back to the fixed ViSpec value.
+    Training state (modes, buffers, reward settings) is restored afterwards.
+    """
+    saved = (ctrl.depth_mode, ctrl.size_mode, ctrl.train_depth, ctrl.train_size,
+             ctrl.measure, ctrl.time_source)
+    depth_mode = "policy" if use_policy and ctrl.trained["depth"] else "fixed"
+    size_mode = "policy" if use_policy and ctrl.trained["size"] else "fixed"
+    ctrl.set_modes(depth_mode, size_mode, False, False)
+    ctrl.measure, ctrl.time_source = True, "measured"
+    ctrl.reset_stats()
+    for j in range(len(pool)):
+        generate(model, pool.inputs(j), args)
+    summ = ctrl.summary()
+    ctrl.reset_stats()
+    ctrl.depth_mode, ctrl.size_mode, ctrl.train_depth, ctrl.train_size = saved[:4]
+    ctrl.measure, ctrl.time_source = saved[4:]
+    return summ
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--base-model-path", type=str, required=True)
@@ -86,9 +96,21 @@ def main():
     p.add_argument("--total-token", type=int, default=30, help="ViSpec size (fixed mode / calibration)")
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--max-new-token", type=int, default=256)
-    p.add_argument("--dataset", type=str, default="coco_caption")
-    p.add_argument("--train-start", type=int, default=100)
-    p.add_argument("--train-num", type=int, default=2000)
+    # data (see vispec/rl/data.py for the splits)
+    p.add_argument("--dataset", type=str, default="coco_caption",
+                   help=f"comma separated training sets from {NAMES}")
+    p.add_argument("--train-num", type=int, default=2000, help="training prompts per set")
+    p.add_argument("--val-dataset", type=str, default=None,
+                   help="comma separated validation sets; default: same as --dataset")
+    p.add_argument("--val-num", type=int, default=30, help="validation prompts per set (0 = off)")
+    p.add_argument("--val-every", type=int, default=10, help="in PPO updates")
+    p.add_argument("--llava-pretrain-dir", type=str, default=None,
+                   help="folder with blip_laion_cc_sbu_558k.json and its images")
+    p.add_argument("--llava-pretrain-skip", type=int, default=68000,
+                   help="skip the prompts ViSpec's draft model was trained on")
+    p.add_argument("--textvqa-dir", type=str, default=None,
+                   help="folder with TextVQA_0.5.1_train.json and train_images/")
+    p.add_argument("--scienceqa-dir", type=str, default="vispec/data/scienceqa")
     # what to train / how the other decision is taken
     p.add_argument("--train", choices=["depth", "size", "both"], default="both")
     p.add_argument("--depth-mode", choices=["fixed", "random", "policy"], default=None)
@@ -165,8 +187,12 @@ def main():
             device,
         )
     ctrl.attach(model.spec_layer)
-    data, build_prompt = load_train_data(args)
-    print(f"{len(data)} training prompts")
+    pool = load_prompts(args.dataset, "train", args.train_num, args)
+    print(f"{len(pool)} training prompts: {pool.counts()}")
+    val_pool = None
+    if args.val_num > 0:
+        val_pool = load_prompts(args.val_dataset or args.dataset, "val", args.val_num, args)
+        print(f"{len(val_pool)} validation prompts: {val_pool.counts()}")
 
     log_f = open(os.path.join(args.save_dir, "train_log.jsonl"), "a")
     with open(os.path.join(args.save_dir, "args.json"), "w") as f:
@@ -174,8 +200,7 @@ def main():
 
     # warm-up (CUDA kernels, caches)
     for _ in range(3):
-        model.specgenerate(**build_prompt(data[0], args), temperature=args.temperature,
-                           max_new_tokens=32, log=True)
+        generate(model, pool.inputs(0), args, max_new_tokens=32)
 
     # ---- 1) calibration -------------------------------------------------
     resumed_rate = ctrl.rate_ref
@@ -183,7 +208,7 @@ def main():
         if args.time_source == "model" and not ctrl.cost.fitted:
             raise ValueError("--skip-calib with --time-source model needs a cost model in --resume")
     else:
-        calib = calibrate(model, ctrl, data, build_prompt, args)
+        calib = calibrate(model, ctrl, pool, args)
         print("calibration:", json.dumps(calib))
         log_f.write(json.dumps({"calibration": calib, "cost": ctrl.cost.state()}) + "\n")
         if resumed_rate is None:
@@ -194,6 +219,13 @@ def main():
     if args.reward_mode == "gain" and ctrl.rate_ref is None:
         raise ValueError("gain reward needs a reference throughput: run calibration or pass --rate-init")
     print(f"reference throughput: {ctrl.rate_ref} tokens/sec")
+
+    # plain ViSpec on the validation prompts: the number every validation is compared to
+    val_base, best_val = None, 0.0
+    if val_pool is not None:
+        val_base = validate(model, ctrl, val_pool, args, use_policy=False)["tokens_per_sec"]
+        print(f"validation, plain ViSpec: {val_base:.2f} tokens/sec")
+        log_f.write(json.dumps({"val_vispec_tokens_per_sec": val_base}) + "\n")
 
     # ---- 2) PPO -----------------------------------------------------------
     train_depth = args.train in ("depth", "both")
@@ -213,17 +245,15 @@ def main():
           f"size: mode={ctrl.size_mode} train={ctrl.train_size} | "
           f"reward={args.reward_mode} time={args.time_source}")
 
-    order = list(range(len(data)))
+    order = list(range(len(pool)))
     random.shuffle(order)
     i, n_update, cycles_done, t_start = 0, 0, 0, time.time()
     while cycles_done < args.total_cycles:
         if i == len(order):
             random.shuffle(order)
             i = 0
-        inputs = build_prompt(data[order[i]], args)
+        generate(model, pool.inputs(order[i]), args)
         i += 1
-        model.specgenerate(**inputs, temperature=args.temperature,
-                           max_new_tokens=args.max_new_token, log=True)
         ctrl.finish_episode()
 
         if trainer.num_ready() >= args.rollout:
@@ -240,6 +270,17 @@ def main():
             rec = {"update": n_update, "cycles": cycles_done,
                    "elapsed_min": round((time.time() - t_start) / 60, 1),
                    "rate_ref": rate_used, **summ, **stats}
+            if val_pool is not None and n_update % args.val_every == 0:
+                v = validate(model, ctrl, val_pool, args, use_policy=True)
+                rec.update({
+                    "val_tokens_per_sec": v["tokens_per_sec"],
+                    "val_speedup_vs_vispec": v["tokens_per_sec"] / val_base,
+                    "val_mean_depth": v["mean_depth"],
+                    "val_mean_size": v["mean_size"],
+                })
+                if v["tokens_per_sec"] > best_val:
+                    best_val = v["tokens_per_sec"]
+                    ctrl.save(os.path.join(args.save_dir, "policy_best.pt"))
             log_f.write(json.dumps(rec) + "\n")
             log_f.flush()
             print(json.dumps({k: (round(v, 4) if isinstance(v, float) else v)
