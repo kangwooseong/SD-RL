@@ -1,3 +1,5 @@
+# Modified from ViSpec (https://github.com/KangJialiang/ViSpec, Apache-2.0):
+# hooks for the RL draft controller were added (lines marked with [RL]). See vispec/rl/.
 # coding=utf-8
 # Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
 #
@@ -1057,6 +1059,12 @@ class Model(nn.Module):
         depth = self.depth
         top_k = self.top_k
 
+        # [RL] optional controller for dynamic depth / verification size
+        ctrl = getattr(self, "rl_controller", None)
+        if ctrl is not None:
+            ctrl.on_draft_start()
+            depth = ctrl.loop_depth(depth)
+
         sample_token = input_ids[:, -1]
 
         scores_list = []
@@ -1164,8 +1172,18 @@ class Model(nn.Module):
                 (tree_mask[:, :, out_ids], self.tree_mask_init), dim=3
             )
 
+            # [RL] depth policy: stop expanding the tree?
+            if ctrl is not None and not ctrl.continue_drafting(
+                i + 1, scores, topk_p, last_p
+            ):
+                break
+
         scores_list = torch.cat(scores_list, dim=0).view(-1)
         ss_token_list = torch.cat(ss_token, dim=0).view(-1)
+        # [RL] size policy: how many draft tokens go to the target model
+        if ctrl is not None:
+            total_tokens = ctrl.choose_size(scores_list, total_tokens)
+        total_tokens = min(total_tokens, scores_list.shape[0])
         top_scores = torch.topk(scores_list, total_tokens, dim=-1)
         top_scores_index = top_scores.indices
         top_scores_index = torch.sort(top_scores_index).values
@@ -1234,6 +1252,9 @@ class Model(nn.Module):
             rid,
         )
         tree_position_ids = tree_position_ids.to(hidden_states.device)
+
+        if ctrl is not None:
+            ctrl.on_draft_end()
 
         return draft_tokens, retrieve_indices, tree_mask, tree_position_ids
 

@@ -1,3 +1,5 @@
+# Modified from ViSpec (https://github.com/KangJialiang/ViSpec, Apache-2.0):
+# hooks for the RL draft controller were added (lines marked with [RL]). See vispec/rl/.
 import copy
 import json
 import os
@@ -200,6 +202,14 @@ class SpecModel(nn.Module):
             total_token = cans[times.index(min(times))]
             model.spec_layer.total_tokens = total_token - 1
 
+        # [RL] VISPEC_RL_POLICY=<ckpt.pt | fixed> attaches the draft controller,
+        # so every gen_spec_answer_*.py script can be used unchanged.
+        rl_policy = os.environ.get("VISPEC_RL_POLICY")
+        if rl_policy:
+            from ..rl.controller import attach_from_env
+
+            attach_from_env(model, rl_policy)
+
         return model
 
     def forward(
@@ -268,6 +278,9 @@ class SpecModel(nn.Module):
         if is_llama3:
             stop_token_id = self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
         max_length = max_length - self.spec_layer.total_tokens - 10
+        ctrl = getattr(self.spec_layer, "rl_controller", None)  # [RL]
+        if ctrl is not None:
+            max_length -= max(0, ctrl.max_size - self.spec_layer.total_tokens)
 
         if temperature > 1e-5:
             logits_processor = prepare_logits_processor(
@@ -455,6 +468,12 @@ class SpecModel(nn.Module):
         input_len = input_ids.shape[1]
         reset_tree_mode(self)
 
+        if ctrl is not None:  # [RL]
+            ctrl.begin_episode(
+                input_len,
+                0 if special_image_mask is None else int(special_image_mask.sum()),
+            )
+
         (
             draft_tokens,
             retrieve_indices,
@@ -482,6 +501,8 @@ class SpecModel(nn.Module):
             start_time = time.time()
 
         for idx in range(max_length):
+            if ctrl is not None:  # [RL]
+                cycle_t0 = ctrl.now()
             # with Timer("all"):
             if not hasattr(self.base_model, "language_model"):
                 self.base_model.model.tree_mask = tree_mask
@@ -508,6 +529,8 @@ class SpecModel(nn.Module):
             # print(accept_length)
             if return_acceptance_len:
                 acceptance_len.append(int(accept_length))
+            if ctrl is not None:  # [RL] tokens produced by this cycle
+                ctrl.on_verified(int(accept_length) + 1)
             # with Timer("update_inference_inputs"):
             (
                 input_ids,
@@ -536,6 +559,8 @@ class SpecModel(nn.Module):
                 # embed_weights,
                 # image_mask=special_image_mask,
             )
+            if ctrl is not None:  # [RL] reward for the cycle that was just verified
+                ctrl.end_cycle(ctrl.now() - cycle_t0)
 
             if is_llama3:
                 if stop_token_id in input_ids[0, input_len:]:
